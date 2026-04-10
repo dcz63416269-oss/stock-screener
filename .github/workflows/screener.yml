@@ -1,26 +1,33 @@
-name: Stock Screener
-
+name: A股主板业绩预增选股
 on:
   schedule:
-    - cron: '25 1 * * 1-5'
+    - cron: '0 1 * * 1-5'
   workflow_dispatch:
 
 jobs:
-  run:
+  screening:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          cache: pip
+          python-version: '3.10'
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install akshare pandas requests
+          python -m pip install --upgrade pip
+          pip install tushare pandas
 
-      - name: Run Strategy
+      - name: Run stock screener
         env:
-          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
         run: python stock_screener.py
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: result
+          path: stock_screen_result.csv
