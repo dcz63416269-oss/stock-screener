@@ -1,79 +1,97 @@
-import akshare as ak
+import tushare as ts
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
+import os
 
-# ==========================
-# 选股：仅主板 + 排除ST
-# ==========================
-def filter_main_board(df):
-    # 必须存在的列
-    if not all(col in df.columns for col in ["code", "name"]):
-        return df
+def main():
+    # 从环境变量读取 token，避免硬编码被 GitHub 泄露
+    TOKEN = os.getenv("TUSHARE_TOKEN")
+    if not TOKEN:
+        print("❌ 未设置 TUSHARE_TOKEN 环境变量")
+        return
 
-    # 过滤ST
-    df = df[~df["name"].str.contains("ST|退|PT", na=False)]
+    ts.set_token(TOKEN)
+    pro = ts.pro_api()
 
-    # 过滤创业板300/科创板688/北交所8
-    df = df[
-        ~df["code"].str.startswith(("300", "688", "8"))
-    ]
-    return df
+    # 选股参数
+    MIN_GROWTH_RATE = 20  # 业绩预增最低幅度(%)
 
-# ==========================
-# 获取业绩预告
-# ==========================
-def get_performance_forecast():
+    def get_latest_trade_date():
+        now = datetime.now()
+        for i in range(7):
+            d = now - timedelta(days=i)
+            if d.weekday() < 5:
+                return d.strftime("%Y%m%d")
+        return now.strftime("%Y%m%d")
+
+    trade_date = get_latest_trade_date()
+    print("📅 交易日期:", trade_date)
+
+    # 1. 主板股票列表
     try:
-        df = ak.stock_profit_forecast()
-        # 重命名适配
-        df = df.rename(columns={
-            "代码": "code",
-            "净利润同比增长(%)": "profit_yoy"
-        })
-        df["profit_yoy"] = pd.to_numeric(df["profit_yoy"], errors="coerce")
-        # 业绩预增 > 0
-        df = df[df["profit_yoy"] > 0]
-        return df[["code", "profit_yoy"]]
-    except:
-        return pd.DataFrame(columns=["code", "profit_yoy"])
+        stock_basic = pro.stock_basic(exchange='', list_status='L',
+                                       fields='ts_code,symbol,name,market,list_date')
+    except Exception as e:
+        print("❌ 获取股票列表失败:", e)
+        return
 
-# ==========================
-# 主选股逻辑
-# ==========================
-def main_screen():
-    print("正在获取 A 股实时数据...")
+    # 只保留沪主板(60) + 深主板(000)，排除创业板/科创板/北交所
+    main_board = stock_basic[
+        stock_basic['ts_code'].str.match(r'^(60|000)')
+    ].copy()
+    main_board = main_board.rename(columns={'ts_code': 'code'})
+    print(f"✅ 主板股票数量: {len(main_board)}")
 
-    # 1. 获取实时行情（唯一稳定接口）
-    df = ak.stock_zh_a_spot()
-    df = df.rename(columns={"symbol": "code"})
+    # 2. 业绩预增
+    try:
+        fore = pro.forecast(
+            start_date=(datetime.strptime(trade_date, "%Y%m%d") - timedelta(days=90)).strftime("%Y%m%d"),
+            end_date=trade_date,
+            fields='ts_code,ann_date,type,p_change_min,p_change_max'
+        )
+    except Exception as e:
+        print("❌ 获取业绩预告失败:", e)
+        return
 
-    # 2. 过滤主板
-    df = filter_main_board(df)
-    print(f"主板过滤后剩余: {len(df)}")
+    if fore.empty:
+        print("⚠️ 无业绩预告数据")
+        return
 
-    # 3. 合并业绩预增
-    perf = get_performance_forecast()
-    df = df.merge(perf, on="code", how="left")
-    df = df[df["profit_yoy"].notna()]
-    print(f"业绩预增过滤后剩余: {len(df)}")
+    fore = fore[fore['type'].isin(['预增', '扭亏'])].copy()
+    fore = fore[fore['p_change_min'] >= MIN_GROWTH_RATE].copy()
+    fore = fore.sort_values(['ts_code', 'ann_date'], ascending=[True, False]).drop_duplicates('ts_code')
+    fore = fore.rename(columns={'ts_code': 'code'})
 
-    # 4. 简单市值过滤（防止过小市值）
-    if "total_shares" in df.columns and "close" in df.columns:
-        df["market_cap"] = pd.to_numeric(df["total_shares"], errors="coerce") * pd.to_numeric(df["close"], errors="coerce")
-        df = df[(df["market_cap"] >= 30 * 1e8) & (df["market_cap"] <= 500 * 1e8)]
+    # 3. 交集：主板 + 业绩预增
+    df = pd.merge(main_board, fore, on='code', how='inner')
+    if df.empty:
+        print("⚠️ 无同时满足主板+业绩预增的股票")
+        return
 
-    # 5. 排序
-    df = df.sort_values("profit_yoy", ascending=False)
+    # 4. 行情与市值
+    try:
+        daily = pro.daily(trade_date=trade_date, fields='ts_code,close,volume_ratio,pct_chg')
+        basic = pro.daily_basic(trade_date=trade_date, fields='ts_code,circ_mv')
+    except Exception as e:
+        print("❌ 获取行情数据失败:", e)
+        return
 
-    # 6. 输出
-    today = datetime.now().strftime("%Y-%m-%d")
-    out = df[["code", "name", "close", "profit_yoy"]].head(15)
-    out.to_csv(f"stock_result_{today}.csv", index=False, encoding="utf-8-sig")
+    daily = daily.rename(columns={'ts_code': 'code'})
+    basic = basic.rename(columns={'ts_code': 'code'})
+    basic['circ_mv_yi'] = basic['circ_mv'] / 100000000
 
-    print("\n选股结果：")
-    print(out)
-    print(f"\n文件已保存: stock_result_{today}.csv")
-    return out
+    df = df.merge(daily, on='code', how='left')
+    df = df.merge(basic, on='code', how='left')
+    df = df.dropna(subset=['close', 'circ_mv_yi'])
+
+    # 5. 输出结果
+    df = df.sort_values('p_change_min', ascending=False).reset_index(drop=True)
+    print("\n🎯 最终筛选结果")
+    print(df[['code', 'name', 'pct_chg', 'volume_ratio', 'circ_mv_yi', 'p_change_min']].head(20))
+
+    # 保存
+    df.to_csv("stock_screen_result.csv", index=False, encoding="utf-8-sig")
+    print("\n✅ 结果已保存为 stock_screen_result.csv")
 
 if __name__ == "__main__":
-    main_screen()
+    main()
