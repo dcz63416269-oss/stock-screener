@@ -1,0 +1,24 @@
+name: Telegram 通知
+
+on:
+  workflow_run:
+    workflows: ["A股主板业绩预增选股"]
+    types: [completed]
+
+jobs:
+  send-telegram:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Telegram Notification
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          format: markdown
+          message: |
+            ${{ github.event.workflow_run.conclusion == 'success' && '✅ 选股任务执行成功' || '❌ 选股任务执行失败' }}
+
+            任务：${{ github.event.workflow_run.name }}
+            状态：${{ github.event.workflow_run.conclusion }}
+            运行ID：${{ github.run_id }}
+            日志：${{ github.event.workflow_run.html_url }}
